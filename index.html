@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Robot Room Mapper</title>
+<style>
+  body{font-family:sans-serif;margin:0;padding:10px;background:#111;color:#eee}
+  button{font-size:16px;padding:10px 12px;margin:3px;border-radius:8px;border:0;background:#2a7;color:#fff}
+  button.red{background:#c44}
+  button.on{background:#e90}
+  input{font-size:16px;padding:8px;border-radius:8px;border:0;width:55%}
+  canvas{width:100%;background:#1d1d1d;border-radius:8px;touch-action:none}
+  #status{font-size:15px;margin:6px 0;min-height:1.2em}
+  .room{display:flex;justify-content:space-between;align-items:center;background:#222;border-radius:8px;padding:6px 10px;margin:4px 0}
+</style>
+</head>
+<body>
+<div id="status">Step 1: Calibrate speed.</div>
+<canvas id="c" width="640" height="640"></canvas>
+<div>
+  <button id="bCal">Calibrate speed</button>
+  <button id="bStart">Start trace</button>
+  <button id="bStop" class="red">Stop trace</button>
+  <button id="bCorner">Corner mode: off</button>
+</div>
+<div>
+  <input id="name" placeholder="Room name">
+  <button id="bSave">Save room</button>
+  <button id="bClear" class="red">Clear</button>
+</div>
+<h3>Saved rooms</h3>
+<div id="rooms"></div>
+
+<script>
+// Phone sits flat on the robot, top edge pointing forward.
+// Trace = robot moves; phone's motion sensors detect movement and
+// compass detects turns. Distance = calibrated speed x moving time.
+const MOVE_THRESH = 0.5;   // m/s^2 spread that counts as "moving"; tune if needed
+const KEY = 'robotRoomMapper.rooms';
+
+const S = {
+  speed: null,        // feet per second, from calibration
+  tracing: false,
+  pts: [],            // traced path, feet
+  corners: [],        // user-tapped corners, feet
+  cur: {x:0, y:0},
+  h: null,            // current compass heading, degrees
+  h0: null,           // heading when trace started
+  moving: false,
+  acc: [],
+  last: 0
+};
+let cornerMode = false;
+let rooms = [];
+try { rooms = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch(e) { rooms = []; }
+
+const c = document.getElementById('c');
+const g = c.getContext('2d');
+const st = document.getElementById('status');
+const say = t => st.textContent = t;
+
+// ---------- sensors ----------
+function onOrient(e){
+  let h = null;
+  if (typeof e.webkitCompassHeading === 'number') h = e.webkitCompassHeading;
+  else if (e.alpha != null) h = (360 - e.alpha + 360) % 360;
+  if (h != null) S.h = h;
+}
+window.addEventListener('deviceorientationabsolute', onOrient);
+window.addEventListener('deviceorientation', onOrient);
+
+window.addEventListener('devicemotion', e => {
+  const a = e.acceleration;
+  if (!a) return;
+  const now = performance.now();
+  S.acc.push(Math.hypot(a.x||0, a.y||0, a.z||0));
+  if (S.acc.length > 30) S.acc.shift();
+  const mean = S.acc.reduce((s,v)=>s+v,0) / S.acc.length;
+  const sd = Math.sqrt(S.acc.reduce((s,v)=>s+(v-mean)**2,0) / S.acc.length);
+  S.moving = sd > MOVE_THRESH;
+  const dt = S.last ? (now - S.last)/1000 : 0;
+  S.last = now;
+  if (S.tracing && S.moving && S.speed && S.h != null && S.h0 != null && dt > 0 && dt < 1) {
+    const th = (S.h - S.h0) * Math.PI / 180;
+    S.cur = {
+      x: S.cur.x + S.speed * dt * Math.sin(th),
+      y: S.cur.y + S.speed * dt * Math.cos(th)
+    };
+    S.pts.push({...S.cur});
+    draw();
+  }
+});
+
+// ---------- buttons ----------
+document.getElementById('bCal').onclick = () => {
+  const s = parseFloat(prompt('Drive the robot exactly 10 feet on the floor and time it.\nEnter seconds taken:'));
+  if (!(s > 0)) return say('Calibration cancelled.');
+  S.speed = 10 / s;
+  say('Speed set: ' + S.speed.toFixed(2) + ' ft/s. Press Start trace, then drive.');
+};
+
+document.getElementById('bStart').onclick = async () => {
+  if (!S.speed) return say('Calibrate speed first.');
+  try {
+    if (typeof DeviceMotionEvent !== 'undefined' && DeviceMotionEvent.requestPermission)
+      await DeviceMotionEvent.requestPermission();
+    if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission)
+      await DeviceOrientationEvent.requestPermission();
+  } catch(e) {}
+  try { if (navigator.wakeLock) await navigator.wakeLock.request('screen'); } catch(e) {}
+  if (S.h == null) return say('No compass reading yet. Check sensors are allowed for this page.');
+  if (S.pts.length === 0) { S.h0 = S.h; S.cur = {x:0,y:0}; S.pts.push({x:0,y:0}); }
+  else if (S.h0 == null) S.h0 = S.h;
+  S.tracing = true;
+  say('Tracing. Drive the robot. Press Stop trace when done.');
+};
+
+document.getElementById('bStop').onclick = () => {
+  S.tracing = false;
+  say('Stopped. ' + S.pts.length + ' points. Tap corners if the map is off, then Save room.');
+};
+
+document.getElementById('bCorner').onclick = e => {
+  cornerMode = !cornerMode;
+  e.target.textContent = 'Corner mode: ' + (cornerMode ? 'on' : 'off');
+  e.target.classList.toggle('on', cornerMode);
+};
+
+document.getElementById('bClear').onclick = () => {
+  if (!confirm('Clear the current trace?')) return;
+  S.tracing = false; S.pts = []; S.corners = []; S.cur = {x:0,y:0}; S.h0 = null;
+  draw(); say('Cleared.');
+};
+
+document.getElementById('bSave').onclick = () => {
+  const name = document.getElementById('name').value.trim();
+  if (!name) return say('Type a room name first.');
+  if (S.pts.length < 2 && S.corners.length < 3) return say('Nothing to save yet.');
+  rooms.push({name, pts: S.pts, corners: S.corners, date: new Date().toISOString()});
+  try { localStorage.setItem(KEY, JSON.stringify(rooms)); } catch(e) {}
+  renderRooms();
+  say('Saved "' + name + '".');
+};
+
+// ---------- corner taps ----------
+function toWorld(ev){
+  const r = c.getBoundingClientRect();
+  const sx = (ev.clientX - r.left) * (c.width / r.width);
+  const sy = (ev.clientY - r.top) * (c.height / r.height);
+  const v = view();
+  return {x: v.cx + (sx - c.width/2)/v.s, y: v.cy - (sy - c.height/2)/v.s};
+}
+c.addEventListener('pointerdown', ev => {
+  if (!cornerMode) return;
+  S.corners.push(toWorld(ev));
+  draw();
+});
+
+// ---------- drawing ----------
+function view(){
+  const xs = [0], ys = [0];
+  S.pts.concat(S.corners).forEach(p => { xs.push(p.x); ys.push(p.y); });
+  const minx = Math.min(...xs), maxx = Math.max(...xs);
+  const miny = Math.min(...ys), maxy = Math.max(...ys);
+  const W = Math.max(maxx - minx, 6), H = Math.max(maxy - miny, 6);
+  const s = Math.min(c.width / (W + 2), c.height / (H + 2));
+  return {s, cx: (minx + maxx)/2, cy: (miny + maxy)/2};
+}
+function X(p, v){ return c.width/2 + (p.x - v.cx) * v.s; }
+function Y(p, v){ return c.height/2 - (p.y - v.cy) * v.s; }
+
+function drawPath(pts, v, color){
+  if (pts.length < 2) return;
+  g.beginPath();
+  g.moveTo(X(pts[0],v), Y(pts[0],v));
+  pts.slice(1).forEach(p => g.lineTo(X(p,v), Y(p,v)));
+  g.strokeStyle = color; g.lineWidth = 3; g.stroke();
+}
+
+function draw(){
+  const v = view();
+  g.clearRect(0,0,c.width,c.height);
+  // scale note
+  g.fillStyle = '#888'; g.font = '20px sans-serif';
+  if (S.speed) g.fillText('1 ft = ' + (v.s).toFixed(0) + ' px', 10, c.height - 10);
+
+  drawPath(S.pts, v, '#3cf');
+  if (S.corners.length >= 3) {
+    g.beginPath();
+    g.moveTo(X(S.corners[0],v), Y(S.corners[0],v));
+    S.corners.slice(1).forEach(p => g.lineTo(X(p,v), Y(p,v)));
+    g.closePath();
+    g.fillStyle = 'rgba(255,200,0,0.15)'; g.fill();
+    g.strokeStyle = '#fc0'; g.lineWidth = 2; g.stroke();
+  }
+  S.corners.forEach(p => {
+    g.beginPath(); g.arc(X(p,v), Y(p,v), 7, 0, Math.PI*2);
+    g.fillStyle = '#fc0'; g.fill();
+  });
+  if (S.pts.length) {
+    const s0 = S.pts[0], e0 = S.pts[S.pts.length-1];
+    g.beginPath(); g.arc(X(s0,v), Y(s0,v), 7, 0, Math.PI*2); g.fillStyle = '#3c3'; g.fill();
+    g.beginPath(); g.arc(X(e0,v), Y(e0,v), 7, 0, Math.PI*2); g.fillStyle = '#f55'; g.fill();
+  }
+}
+
+// ---------- saved rooms ----------
+function renderRooms(){
+  const box = document.getElementById('rooms');
+  box.innerHTML = '';
+  rooms.forEach((r, i) => {
+    const row = document.createElement('div'); row.className = 'room';
+    const label = document.createElement('span'); label.textContent = r.name;
+    label.onclick = () => {
+      S.pts = r.pts; S.corners = r.corners; S.tracing = false;
+      draw(); say('Showing "' + r.name + '".');
+    };
+    const del = document.createElement('button'); del.textContent = 'Delete'; del.className = 'red';
+    del.onclick = () => {
+      if (!confirm('Delete "' + r.name + '"?')) return;
+      rooms.splice(i, 1);
+      try { localStorage.setItem(KEY, JSON.stringify(rooms)); } catch(e) {}
+      renderRooms();
+    };
+    row.append(label, del);
+    box.append(row);
+  });
+  if (!rooms.length) box.textContent = 'No rooms saved yet.';
+}
+
+renderRooms();
+draw();
+</script>
+</body>
+</html>
